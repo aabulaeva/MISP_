@@ -1,0 +1,296 @@
+#!/bin/bash
+
+function getYumCreds() {
+    YUM_CREDS=''
+    [[ -z "$CUSTOMER_USERNAME" && -z $APPLIANCE_INSTALL ]] && echo -n "Enter the username provided by threatquotient to receive updates:   " && read CUSTOMER_USERNAME
+    [[ -z "$CUSTOMER_PASSWORD" && -z $APPLIANCE_INSTALL ]] && echo -n "Enter the password provided by threatquotient to receive updates:   " && read -s CUSTOMER_PASSWORD && echo 
+    [[ ! -z "$CUSTOMER_USERNAME" && -z $APPLIANCE_INSTALL ]] && YUM_CREDS="$CUSTOMER_USERNAME:$CUSTOMER_PASSWORD@"
+}
+
+function verifySelinux() {
+    echo -n "Checking if SELinux is enabled....."
+    sestatus | grep "SELinux status" | grep "enabled" > /dev/null
+    if [ $? -ne 0 ]; then 
+        echo "no"
+        echo
+        echo "SELinux currently disabled!  Please configure SELinux for permissive and reboot" 
+        echo
+        exit 1
+    else
+        echo "yes"
+    fi
+}
+
+function verifyInternet() {
+    echo -n "Checking for internet connectivity....."
+    internetCheck=0
+    curl https://system-updates.threatq.com --connect-timeout 3 > /dev/null 2>&1
+    updatesCheck=$?
+    curl https://rpm.threatq.com/test --connect-timeout 3 > /dev/null 2>&1
+    rpmCheck=$?
+    if [ $updatesCheck != 0 ] || [ $rpmCheck != 0 ]; then
+        echo "no"
+        internetCheck=1
+    else
+        echo "yes"
+    fi
+}
+
+function getProxy() {
+    # Setup Proxy
+    if [ $internetCheck != 0 ]; then
+        x=0
+        while [ $x == 0 ]; do
+            echo -n "Does your network setup require a proxy?  (y/n)?   "
+            read PROXY_REQUIRED
+            if [ ${PROXY_REQUIRED} == "y" ] || [ ${PROXY_REQUIRED} == "Y" ]; then
+                echo -n "Please enter your proxy information in URI format (e.g.  http://<username>:<password>@proxy.address.com:<port>):   "
+                read PROXY
+                echo -n "${PROXY} -- Is this correct? (y/n):   "
+                read PROXY_VERIFY
+                if [ ${PROXY_VERIFY} == "y" ] || [ ${PROXY_VERIFY} == "Y" ]; then
+                    x=1
+                    export http_proxy=${PROXY}
+                    export https_proxy=${PROXY}
+                    verifyInternet
+                    if [ $internetCheck != 0 ]; then
+                        echo
+                        echo "Cannot reach https://rpm.threatq.com/test or https://system-updates.threatq.com!  Please check your network connectivity."
+                        echo
+                        exit 2
+                    fi
+                fi
+            elif [ ${PROXY_REQUIRED} == "n" ] || [ ${PROXY_REQUIRED} == "N" ]; then
+                echo
+                echo "Cannot reach https://rpm.threatq.com or https://system-updates.threatq.com!  Please check your network connectivity."
+                echo
+                exit 2
+                x=1
+            else
+                echo "Invalid choice!"
+            fi
+        done
+    fi
+}
+
+function verifyRootPass() {
+    yumFile="/etc/yum.repos.d/threatq.repo"
+    if [ -f /etc/yum.repos.d/threatq.repo ]; then
+        rm -f ${yumFile}
+    fi
+    if ! command -v perl >/dev/null 2>&1; then
+        echo -n "Installing perl..."
+        yum install -y perl > /dev/null 2>&1 &
+        yumPid=`ps aux | grep yum | grep -v grep | awk '{print $2}'`
+    
+        # Give user output while we install perl 
+        x=0
+        while [ $x == 0 ]; do
+            ps aux | grep $yumPid | grep yum > /dev/null 2>&1
+            if [ $? != 0 ]; then
+                rpm -qa|grep "perl-5" > /dev/null 2>&1
+                if [ $? == 0 ]; then
+                    x=1
+                else
+                    echo
+                    echo
+                    echo "Error downloading perl!"
+                    echo
+                    exit 3
+                fi
+            else
+                echo -n "."
+                sleep 1
+            fi
+        done
+        echo "ok"
+        echo
+    fi
+
+    # Check root password is set correctly
+    echo -n "Checking if root password is set correctly....." 
+    export PASSWD="fln75g98"
+    ORIGPASS=`grep -w "root" /etc/shadow | cut -d: -f2`
+    export ALGO=`echo $ORIGPASS | cut -d'$' -f2`
+    export SALT=`echo $ORIGPASS | cut -d'$' -f3`
+    GENPASS=$(perl -le 'print crypt("$ENV{PASSWD}","\$$ENV{ALGO}\$$ENV{SALT}\$")')
+    if [ "$GENPASS" != "$ORIGPASS" ]
+    then
+        echo "no"
+        echo
+        echo "Invalid root password!  Root password must be set to the evaluation appliance root password!"
+        echo
+        exit 1
+    else
+        echo "yes"
+    fi
+}
+
+function addRepos() {
+    # Add threatq yum repo
+    echo "Creating threatq software repositories....."
+    cat << EOF > /etc/yum.repos.d/threatq.repo
+[threatq]
+name=ThreatQ Repo
+baseurl=https://${YUM_CREDS}rpm.threatq.com/
+enabled=1
+gpgcheck=0
+EOF
+     
+    ### Setup system repositories to use threatq mirrors
+    cat << EOF > /etc/yum.repos.d/threatq-updates.repo
+[threatq-centos-base]
+name=Centos Base Mirror
+baseurl=https://system-updates.threatq.com/centos/7/os/\$basearch
+enabled=1
+gpgcheck=0
+ 
+[threatq-centos-updates]
+name=Centos Updates Mirror
+baseurl=https://system-updates.threatq.com/centos/7/updates/\$basearch
+enabled=1
+gpgcheck=0
+ 
+[threatq-epel]
+name=Epel Mirror
+baseurl=https://system-updates.threatq.com/epel/7/\$basearch
+enabled=1
+gpgcheck=0
+ 
+[threatq-remi]
+name=Remi Mirror
+baseurl=https://system-updates.threatq.com/remi/remi
+enabled=1
+gpgcheck=0
+ 
+[threatq-remi-php56]
+name=Remi-php56 Mirror
+baseurl=https://system-updates.threatq.com/remi/remi-php56
+enabled=1
+gpgcheck=0
+ 
+[threatq-mariadb]
+name=MariaDB Mirror
+baseurl=https://system-updates.threatq.com/mariadb
+enabled=1
+gpgcheck=0
+EOF
+    
+    ### Setup PIP to use threatq mirror
+    if [ ! -z $APPLIANCE_INSTALL ]; then
+        export PIP_INDEX="http://localhost:8080"
+    else
+        export PIP_INDEX="https://system-updates.threatq.com/pypi"
+    fi
+    cat << EOF > /etc/pip.conf
+[global]
+index-url = $PIP_INDEX
+EOF
+}
+
+function setupEnvironment() {
+    echo "Setting up environment....."
+    # Add threatq user
+    useradd -s /sbin/nologin -m threatq
+     
+    # Remove mariadb-libs that ship with CentOS
+    [ -z $APPLIANCE_INSTALL ] && yum erase -y mariadb-libs
+
+    # Disable network repos if installing on an appliance
+    [ ! -z $APPLIANCE_INSTALL ] && export YUMOPTS="--disablerepo=* --enablerepo=c7-media --nogpg"
+
+    # Install yum-config-manager
+    yum install -y $YUMOPTS yum-utils
+     
+    # Disable system repos
+    yum-config-manager -q --disable base updates extras epel remi-safe remi remi-php56
+     
+    # Check if machine is redhat or centos
+    cat /etc/redhat-release | grep "Red Hat"
+    if [ $? == 0 ] ; then
+        APACHE_VER="httpd-2.4.6-45.el7"
+        MOD_SSL_VER="mod_ssl-2.4.6-45.el7"
+        OPENSSL_VER="openssl-1.0.1e-60.el7_3.1 openssl-libs-1.0.1e-60.el7_3.1"
+    else
+        APACHE_VER="httpd-2.4.6"
+        MOD_SSL_VER="mod_ssl-2.4.6"
+        OPENSSL_VER="openssl-1.0.1e openssl-1.0.1e"
+    fi
+    
+    # Install core dependencies
+    yum install -y $YUMOPTS ntp wget firewalld ${APACHE_VER} ${MOD_SSL_VER} ${OPENSSL_VER}
+     
+    # Setup initial firewall
+    systemctl enable firewalld ntpd httpd
+    systemctl start firewalld ntpd httpd
+    
+    # Setup firewall rules
+    firewall-cmd --permanent --add-service=http
+    firewall-cmd --permanent --add-service=https
+    firewall-cmd --reload
+     
+    # Setup SELinux
+    setsebool httpd_execmem 1
+    setsebool httpd_unified 1
+     
+    # Setup hosts file
+    sed -i '/^127.0.0.1/ s/$/ threatq/' /etc/hosts
+    sed -i '/^::1/ s/$/ threatq/' /etc/hosts
+}
+
+function setupProxy() {
+    if [ ! -z ${PROXY} ]; then
+        echo "Configuring proxy....."
+        yumFile="/etc/yum.conf"
+        # Remove proxy from yum.conf if it exists
+        sed -i.bak 's/proxy.*//' ${yumFile}
+        cat ${yumFile} | grep ${PROXY} > /dev/null 2>&1
+        if [ $? != 0 ]; then
+            echo "proxy = ${PROXY}" >> ${yumFile}
+        fi
+        pipFile="/etc/pip.conf"
+        cat ${pipFile} | grep ${PROXY} > /dev/null 2>&1
+        if [ $? != 0 ]; then
+            echo "proxy = ${PROXY}" >> ${pipFile}
+        fi
+    fi
+}
+
+function cleanUp() {
+    echo "Cleaning up installation....."
+    # Remove credentials from yum repo and setup prod yum endpoints
+    sed -i "s;https://.*rpm.*\.threatq\.com;https://rpm\.threatq\.com;" /etc/yum.repos.d/threatq.repo
+    sed -i "s;system-updates-.*\.threatq\.com;system-updates\.threatq\.com;" /etc/yum.repos.d/threatq-updates.repo
+}
+
+
+
+
+####  Check environment before installing  ####
+# Don't perform these checks on an appliance
+if [ -z $APPLIANCE_INSTALL ]; then
+    echo
+    # Set yum credentials
+    getYumCreds
+    # Verify SELinux
+    verifySelinux
+    # Check for internet
+    verifyInternet
+    # Configure proxy
+    getProxy
+    # Verify root pass
+    verifyRootPass
+fi
+
+####  Install threatq  ####
+# Install repositories
+addRepos
+# Setup environment
+setupEnvironment
+# Add proxy configurations
+setupProxy
+# Install threatq
+yum install -y $YUMOPTS threatq
+# Clean up installation
+cleanUp
+
